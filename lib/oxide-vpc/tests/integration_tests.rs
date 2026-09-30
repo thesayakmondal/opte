@@ -2996,6 +2996,131 @@ fn test_reply_to_dhcpv6_solicit_or_request() {
     }
 }
 
+// Test that we reply to a DHCPv6 Information-request message (stateless
+// DHCPv6). The reply carries the configuration data the client asked for, but
+// no addresses.
+#[test]
+fn test_reply_to_dhcpv6_information_request() {
+    let g1_cfg = g1_cfg();
+    let mut g1 = oxide_net_setup("g1_port", &g1_cfg, None, None);
+    g1.port.start();
+    set!(g1, "port_state=running");
+
+    let extra_options = &[
+        dhcpv6::options::Code::DnsServers,
+        dhcpv6::options::Code::DomainList,
+        dhcpv6::options::Code::Fqdn,
+    ];
+    let oro = dhcpv6::options::OptionRequest(extra_options.as_slice().into());
+    let base_options = vec![
+        dhcpv6::options::Option::ClientId(dhcpv6::Duid::from(
+            &g1_cfg.guest_mac,
+        )),
+        dhcpv6::options::Option::ElapsedTime(dhcpv6::options::ElapsedTime(10)),
+        dhcpv6::options::Option::OptionRequest(oro),
+    ];
+
+    // The Server ID is optional in an Information-request, but if present
+    // it must be ours. Check both cases.
+    for has_server_id in [false, true] {
+        let mut options = base_options.clone();
+        if has_server_id {
+            options.push(dhcpv6::options::Option::ServerId(
+                dhcpv6::Duid::from(&g1_cfg.gateway_mac),
+            ));
+        }
+        let request = dhcpv6::protocol::Message {
+            typ: dhcpv6::protocol::MessageType::InformationRequest,
+            xid: dhcpv6::TransactionId::from(&[0u8, 1, 2]),
+            options,
+        };
+        let mut request_pkt_m =
+            packet_from_client_dhcpv6_message(&g1_cfg, &request);
+        let request_pkt =
+            parse_outbound(&mut request_pkt_m, VpcParser {}).unwrap();
+        let res = g1.port.process(Out, request_pkt).unwrap();
+
+        let Hairpin(mut hp) = res else {
+            panic!("Expected a Hairpin, found {res:?}");
+        };
+
+        let reply_pkt =
+            parse_inbound(&mut hp, GenericUlp {}).unwrap().to_full_meta();
+        let out_body = reply_pkt.meta().copy_remaining();
+        drop(reply_pkt);
+
+        let reply = dhcpv6::protocol::Message::from_bytes(&out_body).unwrap();
+        verify_dhcpv6_essentials(
+            &g1_cfg,
+            &mut request_pkt_m,
+            &request,
+            &mut hp,
+            &reply,
+        );
+
+        assert_eq!(reply.typ, dhcpv6::protocol::MessageType::Reply);
+        assert!(reply.has_option(dhcpv6::options::Code::DnsServers));
+        assert!(reply.has_option(dhcpv6::options::Code::DomainList));
+
+        // This is stateless: we must never hand out an address.
+        assert!(!reply.has_option(dhcpv6::options::Code::IaNa));
+        assert!(!reply.has_option(dhcpv6::options::Code::IaTa));
+    }
+}
+
+// Test that invalid DHCPv6 Information-request messages are dropped.
+#[test]
+fn test_dhcpv6_information_request_invalid_is_dropped() {
+    let g1_cfg = g1_cfg();
+    let mut g1 = oxide_net_setup("g1_port", &g1_cfg, None, None);
+    g1.port.start();
+    set!(g1, "port_state=running");
+
+    let client_id = dhcpv6::options::Option::ClientId(dhcpv6::Duid::from(
+        &g1_cfg.guest_mac,
+    ));
+    let elapsed =
+        dhcpv6::options::Option::ElapsedTime(dhcpv6::options::ElapsedTime(10));
+    let iana = dhcpv6::options::IaNa {
+        id: dhcpv6::options::IaId(0xff7),
+        t1: dhcpv6::Lifetime(3600),
+        t2: dhcpv6::Lifetime(6200),
+        options: vec![],
+    };
+
+    let cases = vec![
+        (
+            "IA_NA present",
+            vec![client_id.clone(), dhcpv6::options::Option::IaNa(iana)],
+        ),
+        (
+            "Server ID belongs to another server",
+            vec![
+                client_id.clone(),
+                dhcpv6::options::Option::ServerId(dhcpv6::Duid::from(
+                    &g1_cfg.guest_mac,
+                )),
+            ],
+        ),
+        ("no Client ID", vec![elapsed]),
+    ];
+
+    for (name, options) in cases {
+        let request = dhcpv6::protocol::Message {
+            typ: dhcpv6::protocol::MessageType::InformationRequest,
+            xid: dhcpv6::TransactionId::from(&[0u8, 1, 2]),
+            options,
+        };
+        let mut pkt_m = packet_from_client_dhcpv6_message(&g1_cfg, &request);
+        let pkt = parse_outbound(&mut pkt_m, VpcParser {}).unwrap();
+        let res = g1.port.process(Out, pkt);
+        assert!(
+            matches!(res, Ok(ProcessResult::Drop { .. })),
+            "{name}: expected the packet to be dropped, found {res:?}"
+        );
+    }
+}
+
 fn establish_http_conn(
     g1_cfg: &VpcCfg,
     g1: &mut PortAndVps,

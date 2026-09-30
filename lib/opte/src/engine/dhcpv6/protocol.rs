@@ -583,6 +583,50 @@ fn process_confirm_message<'a>(
     }
 }
 
+// Handle an Information-request message (stateless DHCPv6).
+//
+// The client already has its address(es) and only wants configuration
+// data, such as DNS servers. This always results in a Reply message, and
+// never assigns or tracks any addresses.
+//
+// See https://www.rfc-editor.org/rfc/rfc8415.html#section-18.2.6 for how
+// servers are required to process such messages.
+//
+// A reply to be sent back to the client is returned in `Some(_)`. If the
+// message should be dropped, `None` is returned instead.
+fn process_information_request_message<'a>(
+    action: &'a Dhcpv6Action,
+    client_msg: &'a Message<'a>,
+) -> Option<Message<'a>> {
+    // A Server ID is optional here, but if present it must be ours.
+    if let Some(id) = client_msg.server_duid()
+        && !id.is_duid_ll_mac(&action.server_mac)
+    {
+        return None;
+    }
+
+    // Information-request messages must not contain any IA options.
+    if client_msg.has_option(OptionCode::IaNa)
+        || client_msg.has_option(OptionCode::IaTa)
+    {
+        return None;
+    }
+
+    // Must have a Client ID option. `generate_reply_options` would panic
+    // without one.
+    if !client_msg.has_option(OptionCode::ClientId) {
+        return None;
+    }
+
+    // Generate all the options we'll send back to the client.
+    let options = generate_reply_options(action, client_msg);
+    Some(Message {
+        typ: MessageType::Reply,
+        xid: client_msg.xid.clone(),
+        options,
+    })
+}
+
 // Process a DHCPv6 message from the a client.
 fn process_client_message<'a>(
     action: &'a Dhcpv6Action,
@@ -593,6 +637,9 @@ fn process_client_message<'a>(
         MessageType::Solicit => process_solicit_message(action, client_msg),
         MessageType::Request => process_request_message(action, client_msg),
         MessageType::Confirm => process_confirm_message(action, client_msg),
+        MessageType::InformationRequest => {
+            process_information_request_message(action, client_msg)
+        }
         // TODO-completeness: Handle other message types.
         //
         // This is pretty low-priority right now. Conforming clients must use
