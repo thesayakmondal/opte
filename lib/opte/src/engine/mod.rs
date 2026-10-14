@@ -33,6 +33,7 @@ pub mod tcp;
 pub mod tcp_state;
 #[macro_use]
 pub mod udp;
+pub mod udplite;
 
 use crate::ddi::mblk::MsgBlk;
 use checksum::Checksum;
