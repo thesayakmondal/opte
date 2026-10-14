@@ -39,6 +39,7 @@ use super::parse::ValidUlp;
 use super::port::meta::ActionMeta;
 use super::predicate::DataPredicate;
 use super::predicate::Predicate;
+use super::udplite::UdpLiteMut;
 use crate::ddi::mblk::MsgBlk;
 use alloc::boxed::Box;
 use alloc::ffi::CString;
@@ -436,6 +437,15 @@ impl CompiledTransform {
                 }
             }
             (ValidUlp::Udp(pkt), Some(tx)) => {
+                if let Some(new_src) = &tx.generic.src_port {
+                    pkt.set_source(*new_src);
+                }
+
+                if let Some(new_dst) = &tx.generic.dst_port {
+                    pkt.set_destination(*new_dst);
+                }
+            }
+            (ValidUlp::UdpLite(pkt), Some(tx)) => {
                 if let Some(new_src) = &tx.generic.src_port {
                     pkt.set_source(*new_src);
                 }
