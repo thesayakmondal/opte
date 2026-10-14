@@ -48,6 +48,8 @@ use crate::ddi::mblk::MsgBlkNode;
 use crate::ddi::mblk::request_mblk_offload;
 use crate::engine::flow_table::FlowEntryInfo;
 use crate::engine::geneve::GeneveMeta;
+use crate::engine::udplite::UdpLiteRef;
+use crate::engine::udplite::covered_body;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -656,6 +658,10 @@ impl<T: Read + Pullup> From<&PacketData<T>> for InnerFlowId {
                 PortInfo { src_port: u.source(), dst_port: u.destination() }
                     .into()
             }
+            Some(Ulp::UdpLite(u)) => {
+                PortInfo { src_port: u.source(), dst_port: u.destination() }
+                    .into()
+            }
             Some(Ulp::IcmpV4(v4)) => IcmpInfo {
                 ty: v4.ty().0,
                 code: v4.code(),
@@ -903,6 +909,12 @@ impl<T: Read + Pullup> Packet<FullParsed<T>> {
                         Ulp::Tcp(Header::Raw(t)) => UlpRepr::Tcp(t.into()),
                         Ulp::Udp(Header::Repr(t)) => UlpRepr::Udp(*t.clone()),
                         Ulp::Udp(Header::Raw(t)) => UlpRepr::Udp(t.into()),
+                        Ulp::UdpLite(Header::Repr(t)) => {
+                            UlpRepr::UdpLite(*t.clone())
+                        }
+                        Ulp::UdpLite(Header::Raw(t)) => {
+                            UlpRepr::UdpLite(t.into())
+                        }
                         Ulp::IcmpV4(Header::Repr(t)) => {
                             UlpRepr::IcmpV4(*t.clone())
                         }
@@ -1192,7 +1204,14 @@ impl<T: Read + Pullup> Packet<FullParsed<T>> {
         T: Pullup,
     {
         let mut body_csum = Checksum::new();
-        body_csum.add_bytes(self.body().unwrap_or_default());
+        let body = self.body().unwrap_or_default();
+        // UDP-Lite only checksums the first `coverage` octets of the
+        // datagram (RFC 3828), rather than the whole body.
+        let body = match &self.state.meta.headers.inner_ulp {
+            Some(Ulp::UdpLite(u)) => covered_body(u.coverage(), body),
+            _ => body,
+        };
+        body_csum.add_bytes(body);
         self.state.body_csum = Some(body_csum);
 
         if let Some(ulp) = &mut self.state.meta.headers.inner_ulp {
