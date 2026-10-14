@@ -36,6 +36,12 @@ use super::packet::MismatchError;
 use super::packet::OpteMeta;
 use super::packet::ParseError;
 use super::rule::CompiledTransform;
+use super::udplite::IPPROTO_UDPLITE;
+use super::udplite::UdpLite;
+use super::udplite::UdpLiteMut;
+use super::udplite::UdpLiteRef;
+use super::udplite::ValidUdpLite;
+use super::udplite::nonzero_checksum;
 use crate::api::IcmpInfo;
 use crate::api::PortInfo;
 use core::fmt;
@@ -90,6 +96,7 @@ pub enum L4 {
 pub enum Ulp {
     Tcp = IpProtocol::TCP,
     Udp = IpProtocol::UDP,
+    UdpLite = IPPROTO_UDPLITE,
     IcmpV4 = IpProtocol::ICMP,
     IcmpV6 = IpProtocol::ICMP_V6,
 }
@@ -102,6 +109,7 @@ impl<B: ByteSlice + SplitByteSlice> Ulp<B> {
         match self {
             Ulp::Tcp(t) => t.to_owned(None).unwrap().into(),
             Ulp::Udp(t) => t.to_owned(None).unwrap().into(),
+            Ulp::UdpLite(t) => t.to_owned(None).unwrap().into(),
             Ulp::IcmpV4(t) => t.to_owned(None).unwrap().into(),
             Ulp::IcmpV6(t) => t.to_owned(None).unwrap().into(),
         }
@@ -170,6 +178,20 @@ impl<B: ByteSliceMut> Ulp<B> {
                 }
                 udp.set_checksum(csum.finalize_for_ingot());
             }
+            Ulp::UdpLite(udp) => {
+                udp.set_checksum(0);
+                match udp {
+                    Header::Repr(udp) => {
+                        let mut bytes = [0u8; 8];
+                        udp.emit_raw(&mut bytes[..]);
+                        csum.add_bytes(&bytes[..]);
+                    }
+                    Header::Raw(udp) => {
+                        csum.add_bytes(udp.0.as_bytes());
+                    }
+                }
+                udp.set_checksum(nonzero_checksum(csum.finalize_for_ingot()));
+            }
         }
     }
 }
@@ -180,6 +202,7 @@ impl<B: ByteSlice> ValidUlp<B> {
         match self {
             ValidUlp::Tcp(t) => t.checksum(),
             ValidUlp::Udp(u) => u.checksum(),
+            ValidUlp::UdpLite(u) => u.checksum(),
             ValidUlp::IcmpV4(i4) => i4.checksum(),
             ValidUlp::IcmpV6(i6) => i6.checksum(),
         }
@@ -191,6 +214,7 @@ impl<B: ByteSlice> ValidUlp<B> {
         match self {
             ValidUlp::Tcp(_) => IpProtocol::TCP,
             ValidUlp::Udp(_) => IpProtocol::UDP,
+            ValidUlp::UdpLite(_) => IPPROTO_UDPLITE,
             ValidUlp::IcmpV4(_) => IpProtocol::ICMP,
             ValidUlp::IcmpV6(_) => IpProtocol::ICMP_V6,
         }
@@ -241,6 +265,15 @@ impl<B: ByteSliceMut> ValidUlp<B> {
                 body_csum.add_bytes(udp.0.as_bytes());
                 udp.set_checksum(body_csum.finalize_for_ingot());
             }
+            ValidUlp::UdpLite(udp) => {
+                body_csum += l3.pseudo_header();
+
+                udp.set_checksum(0);
+                body_csum.add_bytes(udp.0.as_bytes());
+                udp.set_checksum(nonzero_checksum(
+                    body_csum.finalize_for_ingot(),
+                ));
+            }
         }
     }
 }
@@ -250,6 +283,7 @@ impl<B: ByteSlice> Ulp<B> {
         match self {
             Ulp::Tcp(t) => Some(t.source()),
             Ulp::Udp(u) => Some(u.source()),
+            Ulp::UdpLite(u) => Some(u.source()),
             _ => None,
         }
     }
@@ -258,6 +292,7 @@ impl<B: ByteSlice> Ulp<B> {
         match self {
             Ulp::Tcp(t) => Some(t.destination()),
             Ulp::Udp(t) => Some(t.destination()),
+            Ulp::UdpLite(t) => Some(t.destination()),
             _ => None,
         }
     }
@@ -406,6 +441,9 @@ fn flow_id<V: ByteSlice>(
             PortInfo { src_port: t.source(), dst_port: t.destination() }.into()
         }
         Some(ValidUlp::Udp(u)) => {
+            PortInfo { src_port: u.source(), dst_port: u.destination() }.into()
+        }
+        Some(ValidUlp::UdpLite(u)) => {
             PortInfo { src_port: u.source(), dst_port: u.destination() }.into()
         }
         Some(ValidUlp::IcmpV4(v4)) => IcmpInfo {
@@ -592,11 +630,45 @@ fn validate_udp<V: ByteSlice>(
     }
 }
 
+#[inline]
+fn validate_udplite<V: ByteSlice>(
+    pkt: &ValidUdpLite<V>,
+    bytes_after: usize,
+) -> Result<(), ParseError> {
+    // RFC 3828, section 3.1: coverage is counted from the first octet of the
+    // UDP-Lite header, and the datagram length is taken from the IP layer.
+    // As with UDP, trailing padding may make `bytes_after` larger than the
+    // IP payload actually is, which can only make this check more lenient.
+    let datagram_len = bytes_after + pkt.packet_length();
+    let coverage = pkt.coverage() as usize;
+
+    // A coverage of zero covers the whole datagram. Anything from 1 to 7
+    // would leave part of the header itself uncovered, which is not allowed.
+    if coverage != 0 && coverage < UdpLite::MINIMUM_LENGTH {
+        return Err(ParseError::BadLength(MismatchError {
+            location: c"UdpLite.coverage",
+            expected: UdpLite::MINIMUM_LENGTH as u64,
+            actual: coverage as u64,
+        }));
+    }
+
+    if coverage > datagram_len {
+        return Err(ParseError::BadLength(MismatchError {
+            location: c"UdpLite.coverage",
+            expected: datagram_len as u64,
+            actual: coverage as u64,
+        }));
+    }
+
+    Ok(())
+}
+
 impl<V: ByteSlice> ValidUlp<V> {
     #[inline]
     fn validate(&self, bytes_after: usize) -> Result<(), ParseError> {
         match self {
             ValidUlp::Udp(u) => validate_udp(u, bytes_after),
+            ValidUlp::UdpLite(u) => validate_udplite(u, bytes_after),
             _ => Ok(()),
         }
     }
@@ -765,6 +837,25 @@ fn csum_minus_hdr<V: ByteSlice>(ulp: &ValidUlp<V>) -> Option<Checksum> {
 
             Some(csum)
         }
+        ValidUlp::UdpLite(udp) => {
+            // Unlike UDP, a zero checksum is *invalid* for UDP-Lite rather
+            // than meaning that no checksum was computed (RFC 3828, section
+            // 3.1). Don't attempt to incrementally update such a packet.
+            if udp.checksum() == 0 {
+                return None;
+            }
+
+            let mut csum = Checksum::from(HeaderChecksum::wrap(
+                udp.checksum().to_be_bytes(),
+            ));
+
+            // Subtract the ports and coverage. What remains is the sum of
+            // the pseudo-header and of the *covered* part of the body.
+            let b = udp.0.as_bytes();
+            csum.sub_bytes(&b[0..6]);
+
+            Some(csum)
+        }
     }
 }
 
@@ -791,6 +882,14 @@ impl<T: ByteSliceMut> HeaderActionModify<UlpMetaModify> for Ulp<T> {
                 }
             }
             Ulp::Udp(u) => {
+                if let Some(src) = mod_spec.generic.src_port {
+                    u.set_source(src);
+                }
+                if let Some(dst) = mod_spec.generic.dst_port {
+                    u.set_destination(dst);
+                }
+            }
+            Ulp::UdpLite(u) => {
                 if let Some(src) = mod_spec.generic.src_port {
                     u.set_source(src);
                 }
