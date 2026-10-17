@@ -22,7 +22,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Deref;
 use core::ops::DerefMut;
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::AtomicI64;
 use core::sync::atomic::Ordering;
 use ingot::icmp::IcmpV4;
 use ingot::icmp::IcmpV4Mut;
@@ -157,7 +157,7 @@ struct UnsolicitedRa {
     ///
     /// This is stored in nanos, derived from a `Moment`, so that we can use it
     /// in an atomic.
-    next_time_to_send: AtomicU64,
+    next_time_to_send: AtomicI64,
     /// The raw packet to send.
     ///
     /// We know this upfront, because the unsolicited RA is always from the same
@@ -214,8 +214,8 @@ impl UnsolicitedRa {
             Ipv6Addr::ALL_NODES,
         );
         UnsolicitedRa {
-            next_time_to_send: AtomicU64::new(
-                Moment::now().raw() + Self::random_interval(),
+            next_time_to_send: AtomicI64::new(
+                Moment::now().raw() + Self::random_interval() as i64,
             ),
             packet: pkt_layers.emit_vec(),
         }
@@ -262,7 +262,7 @@ impl UnsolicitedRa {
     /// is returned instead.
     fn is_time_to_send(&self) -> bool {
         let now = Moment::now().raw();
-        let interval = Self::random_interval();
+        let interval = Self::random_interval() as i64;
         self.next_time_to_send
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |timeout_at| {
                 // Returns Some(now) if we've reached our timeout, or None
@@ -988,7 +988,8 @@ mod tests {
             .next_time_to_send
             .load(Ordering::Relaxed);
         let sleep_for = core::time::Duration::from_nanos(
-            timeout_at.saturating_sub(Moment::now().raw()),
+            u64::try_from(timeout_at.saturating_sub(Moment::now().raw()))
+                .unwrap_or(0),
         ) * 2;
         std::thread::sleep(sleep_for);
         let mut it = net.autonomous_packets();

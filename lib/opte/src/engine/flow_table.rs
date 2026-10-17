@@ -25,6 +25,7 @@ use core::num::NonZeroU16;
 use core::num::NonZeroU32;
 use core::ops::ControlFlow;
 use core::sync::atomic::AtomicBool;
+use core::sync::atomic::AtomicI64;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
@@ -727,9 +728,9 @@ pub trait FlowState: Dump + 'static {
 struct FlowLifetime {
     /// This tracks the last time the flow was matched.
     ///
-    /// These are raw u64s sourced from a `Moment`, which tracks time
+    /// These are raw i64s sourced from a `Moment`, which tracks time
     /// in nanoseconds.
-    last_hit: AtomicU64,
+    last_hit: AtomicI64,
 
     /// Whether this flow entry has been explicitly removed.
     killed: AtomicBool,

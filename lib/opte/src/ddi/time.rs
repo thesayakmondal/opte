@@ -111,28 +111,35 @@ impl Moment {
 
     /// Return the underlying timestamp for atomic storage or debugging, converted
     /// to milliseconds.
+    ///
+    /// Negative timestamps are clamped to zero.
     pub(crate) fn raw_millis(&self) -> u64 {
-        self.raw() / NANOS_TO_MILLIS
+        u64::try_from(self.raw()).unwrap_or(0) / NANOS_TO_MILLIS
     }
 
     /// Return the underlying timestamp for atomic storage or debugging.
-    pub fn raw(&self) -> u64 {
+    ///
+    /// This is signed to match `hrtime_t`, so that it can be stored in an
+    /// `AtomicI64` without any lossy conversion.
+    pub fn raw(&self) -> i64 {
         cfg_if! {
             if #[cfg(all(not(feature = "std"), not(test)))] {
-                self.inner as u64
+                self.inner
             } else {
                 // Conversion here is truncating.
-                self.inner.as_nanos() as u64
+                self.inner.as_nanos() as i64
             }
         }
     }
 
-    pub(crate) fn from_raw_nanos(raw: u64) -> Self {
+    pub(crate) fn from_raw_nanos(raw: i64) -> Self {
         cfg_if! {
             if #[cfg(all(not(feature = "std"), not(test)))] {
-                Self { inner: raw as ddi::hrtime_t }
+                Self { inner: raw }
             } else {
-                Self { inner: Duration::from_nanos(raw) }
+                // `Duration` cannot be negative, so clamp to zero.
+                let nanos = u64::try_from(raw).unwrap_or(0);
+                Self { inner: Duration::from_nanos(nanos) }
             }
         }
     }
