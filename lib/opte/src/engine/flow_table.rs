@@ -20,6 +20,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
+use c8str::C8Str;
+use core::ffi::CStr;
 use core::fmt;
 use core::num::NonZeroU16;
 use core::num::NonZeroU32;
@@ -271,7 +273,7 @@ pub type FlowTableDump<T> = Vec<(InnerFlowId, T)>;
 
 #[derive(Debug)]
 pub struct FlowTable<S: FlowState> {
-    port_c: CString,
+    port: Arc<C8Str>,
     name_c: CString,
     limit: NonZeroU32,
     policy: Arc<dyn ExpiryPolicy<S>>,
@@ -373,7 +375,13 @@ impl<S: FlowState> FlowTable<S> {
     }
 
     pub(crate) fn expire(&mut self, flowid: &InnerFlowId, mark_evicted: bool) {
-        flow_expired_probe(&self.port_c, &self.name_c, flowid, None, None);
+        flow_expired_probe(
+            self.port.as_c8_str(),
+            &self.name_c,
+            flowid,
+            None,
+            None,
+        );
         if let Some(entry) = self.map.remove(flowid) {
             entry.expiry_cleanup();
             if mark_evicted {
@@ -385,7 +393,6 @@ impl<S: FlowState> FlowTable<S> {
     /// Remove all flows from `self` which are past their expiry time.
     pub fn expire_flows(&mut self, now: Moment) {
         let name_c = &self.name_c;
-        let port_c = &self.port_c;
 
         self.map.retain(|flowid, entry| {
             // A flow cannot be expired by the timer while it still has children
@@ -415,7 +422,7 @@ impl<S: FlowState> FlowTable<S> {
             if entry.is_expired(now) {
                 let my_time = entry.last_hit();
                 flow_expired_probe(
-                    port_c,
+                    self.port.as_c8_str(),
                     name_c,
                     flowid,
                     Some(my_time.raw_millis()),
@@ -448,7 +455,6 @@ impl<S: FlowState> FlowTable<S> {
         T: FlowState,
     {
         let name_c = &self.name_c;
-        let port_c = &self.port_c;
 
         self.map.retain(|flowid, entry| {
             // A flow cannot be expired by the timer while it still has children
@@ -475,7 +481,7 @@ impl<S: FlowState> FlowTable<S> {
             if entry.is_expired(now) {
                 let my_time = entry.last_hit();
                 flow_expired_probe(
-                    port_c,
+                    self.port.as_c8_str(),
                     name_c,
                     flowid,
                     Some(my_time.raw_millis()),
@@ -645,7 +651,7 @@ impl<S: FlowState> FlowTable<S> {
     }
 
     pub fn new(
-        port: &str,
+        port: Arc<C8Str>,
         name: &str,
         limit: NonZeroU32,
         policy: Option<Arc<dyn ExpiryPolicy<S>>>,
@@ -653,7 +659,7 @@ impl<S: FlowState> FlowTable<S> {
         let policy = policy.unwrap_or_else(|| Arc::new(FLOW_DEF_TTL));
 
         Self {
-            port_c: CString::new(port).unwrap(),
+            port,
             name_c: CString::new(name).unwrap(),
             limit,
             policy,
@@ -681,8 +687,8 @@ impl<S: FlowState> FlowTable<S> {
 
 #[allow(unused_variables)]
 fn flow_expired_probe(
-    port: &CString,
-    name: &CString,
+    port: &C8Str,
+    name: &CStr,
     flowid: &InnerFlowId,
     last_hit: Option<u64>,
     now: Option<u64>,
@@ -698,7 +704,7 @@ fn flow_expired_probe(
             );
         } else if #[cfg(feature = "usdt")] {
             use std::string::ToString;
-            let port_s = port.to_str().unwrap();
+            let port_s = port.to_str();
             let name_s = name.to_str().unwrap();
             crate::opte_provider::flow__expired!(
                 || (port_s, name_s, flowid.to_string(), last_hit.unwrap_or_default(), now.unwrap_or_default())
@@ -1080,7 +1086,13 @@ mod test {
     use crate::api::PortInfo;
     use crate::engine::ip::v4::Protocol;
     use crate::engine::packet::AddrPair;
+    use c8str::c8;
     use core::time::Duration;
+
+    fn dummy_port_name() -> Arc<C8Str> {
+        const PORT_NAME: &C8Str = c8!("port");
+        Arc::from(PORT_NAME.to_owned().into_boxed_c8_str())
+    }
 
     impl Dump for () {
         type DumpVal = ();
@@ -1144,7 +1156,12 @@ mod test {
             proto_info: PortInfo { src_port: 37890, dst_port: 443 }.into(),
         };
 
-        let mut ft = FlowTable::new("port", "flow-expired-test", FT_SIZE, None);
+        let mut ft = FlowTable::new(
+            dummy_port_name(),
+            "flow-expired-test",
+            FT_SIZE,
+            None,
+        );
         assert_eq!(ft.num_flows(), 0);
         ft.add(flowid, ()).unwrap();
         let now = Moment::now();
@@ -1166,7 +1183,8 @@ mod test {
             proto_info: PortInfo { src_port: 37890, dst_port: 443 }.into(),
         };
 
-        let mut ft = FlowTable::new("port", "flow-clear-test", FT_SIZE, None);
+        let mut ft =
+            FlowTable::new(dummy_port_name(), "flow-clear-test", FT_SIZE, None);
         assert_eq!(ft.num_flows(), 0);
         ft.add(flowid, ()).unwrap();
         assert_eq!(ft.num_flows(), 1);
@@ -1185,8 +1203,11 @@ mod test {
             proto_info: PortInfo { src_port: 37890, dst_port: 443 }.into(),
         };
 
-        let mut ft1 = FlowTable::new("port", "parent-table", FT_SIZE, None);
-        let mut ft2 = FlowTable::new("port", "child-table", FT_SIZE, None);
+        let pname = dummy_port_name();
+
+        let mut ft1 =
+            FlowTable::new(pname.clone(), "parent-table", FT_SIZE, None);
+        let mut ft2 = FlowTable::new(pname, "child-table", FT_SIZE, None);
         let fe1 = ft1.add(flowid, ()).unwrap();
         let fe2 = ft2.add(flowid, ()).unwrap();
 
@@ -1219,8 +1240,11 @@ mod test {
             proto_info: PortInfo { src_port: 37890, dst_port: 443 }.into(),
         };
 
-        let mut ft1 = FlowTable::new("port", "parent-table", FT_SIZE, None);
-        let mut ft2 = FlowTable::new("port", "child-table", FT_SIZE, None);
+        let pname = dummy_port_name();
+
+        let mut ft1 =
+            FlowTable::new(pname.clone(), "parent-table", FT_SIZE, None);
+        let mut ft2 = FlowTable::new(pname, "child-table", FT_SIZE, None);
         let fe1 = ft1.add(flowid, ()).unwrap();
         let fe2 =
             ft2.add(flowid, ParentSet(vec![fe1.clone() as Arc<_>])).unwrap();
@@ -1252,11 +1276,13 @@ mod test {
             proto_info: PortInfo { src_port: 37890, dst_port: 443 }.into(),
         };
 
+        let pname = dummy_port_name();
+
         // Fill up the tables.
         let mut default_ft =
-            FlowTable::new("port", "no-prio-table", FT_SIZE, None);
+            FlowTable::new(pname.clone(), "no-prio-table", FT_SIZE, None);
         let mut evict_ft = FlowTable::new(
-            "port",
+            pname,
             "prio-table",
             FT_SIZE,
             Some(Arc::new(FixedPolicy {
@@ -1317,7 +1343,7 @@ mod test {
         };
 
         let mut evict_ft = FlowTable::new(
-            "port",
+            dummy_port_name(),
             "prio-table",
             FT_SIZE,
             Some(Arc::new(FixedPolicy {
@@ -1366,11 +1392,15 @@ mod test {
             proto_info: PortInfo { src_port: 37890, dst_port: 443 }.into(),
         };
 
-        let mut ft1 = FlowTable::new("port", "parent-table", FT_SIZE, None);
-        let mut ft2 = FlowTable::new("port", "child-table", FT_SIZE, None);
+        let pname = dummy_port_name();
+
+        let mut ft1 =
+            FlowTable::new(pname.clone(), "parent-table", FT_SIZE, None);
+        let mut ft2 =
+            FlowTable::new(pname.clone(), "child-table", FT_SIZE, None);
         let mut ft2_2 =
-            FlowTable::new("port", "other-child-table", FT_SIZE, None);
-        let mut ft3 = FlowTable::new("port", "grandchild-table", FT_SIZE, None);
+            FlowTable::new(pname.clone(), "other-child-table", FT_SIZE, None);
+        let mut ft3 = FlowTable::new(pname, "grandchild-table", FT_SIZE, None);
         let fe1 = ft1.add(flowid, ()).unwrap();
         let fe2 = ft2.add(flowid, ()).unwrap();
         let fe_out_of_chain = ft2_2.add(flowid, ()).unwrap();
@@ -1402,9 +1432,12 @@ mod test {
             proto_info: PortInfo { src_port: 37890, dst_port: 443 }.into(),
         };
 
-        let mut ft1 = FlowTable::new("port", "parent-table", FT_SIZE, None);
+        let pname = dummy_port_name();
+
+        let mut ft1 =
+            FlowTable::new(pname.clone(), "parent-table", FT_SIZE, None);
         let mut ft2 = FlowTable::new(
-            "port",
+            pname.clone(),
             "child-table",
             FT_SIZE,
             Some(Arc::new(FixedPolicy {
@@ -1414,7 +1447,7 @@ mod test {
             })),
         );
         let mut ft2_2 = FlowTable::new(
-            "port",
+            pname.clone(),
             "other-child-table",
             FT_SIZE,
             Some(Arc::new(FixedPolicy {
@@ -1424,7 +1457,7 @@ mod test {
             })),
         );
         let mut ft2_3 = FlowTable::new(
-            "port",
+            pname,
             "other-other-child-table",
             FT_SIZE,
             Some(Arc::new(FixedPolicy {
@@ -1502,7 +1535,7 @@ mod test {
         };
 
         let mut evict_ft = FlowTable::new(
-            "port",
+            dummy_port_name(),
             "prio-table",
             table_size,
             Some(Arc::new(FixedPolicy {
