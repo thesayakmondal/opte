@@ -284,6 +284,7 @@ use opte::engine::parse::ValidUlp;
 use opte::engine::port::Port;
 use opte::engine::port::PortBuilder;
 use opte::engine::port::ProcessResult;
+use opte::engine::port::meta::FlowDep;
 use opte::engine::rule::MappingResource;
 use oxide_vpc::api::AddFwRuleReq;
 use oxide_vpc::api::AddRouterEntryReq;
@@ -4057,7 +4058,11 @@ fn set_fw_rules_hdlr(env: &mut IoctlEnvelope) -> Result<NoResp, OpteError> {
 fn set_v2p_hdlr(env: &mut IoctlEnvelope) -> Result<NoResp, OpteError> {
     let req: SetVirt2PhysReq = env.copy_in_req()?;
     let state = get_xde_state();
-    state.vpc_map.add(req.vip, req.phys);
+    // Flows already cached in a port's UFT embed the old mapping, so once the
+    // table is updated we must retire those flows (and only those).
+    if let Some(dep) = state.vpc_map.update(req.vip, req.phys) {
+        invalidate_flows_for(state, &dep);
+    }
     Ok(NoResp::default())
 }
 
@@ -4065,8 +4070,21 @@ fn set_v2p_hdlr(env: &mut IoctlEnvelope) -> Result<NoResp, OpteError> {
 fn clear_v2p_hdlr(env: &mut IoctlEnvelope) -> Result<NoResp, OpteError> {
     let req: ClearVirt2PhysReq = env.copy_in_req()?;
     let state = get_xde_state();
-    state.vpc_map.del(&req.vip, &req.phys);
+    if state.vpc_map.del(&req.vip, &req.phys).is_some() {
+        let dep = overlay::v2p_dep(req.phys.vni, &req.vip);
+        invalidate_flows_for(state, &dep);
+    }
     Ok(NoResp::default())
+}
+
+/// Retire every cached flow, on every port, which was built from `dep`.
+///
+/// This must run *after* the state `dep` names has been updated.
+fn invalidate_flows_for(state: &XdeState, dep: &FlowDep) {
+    let devs = state.devs.read();
+    for dev in devs.iter() {
+        dev.port.invalidate_flows_for(dep);
+    }
 }
 
 #[unsafe(no_mangle)]

@@ -78,6 +78,8 @@ use crate::engine::packet::EmitSpec;
 use crate::engine::packet::PushSpec;
 use crate::engine::rule::CompiledEncap;
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::collections::BTreeSet;
 use alloc::ffi::CString;
 use alloc::string::String;
 use alloc::string::ToString;
@@ -102,6 +104,7 @@ use ingot::types::Emit;
 use ingot::types::HeaderLen;
 use ingot::types::Read;
 use meta::ActionMeta;
+use meta::FlowDep;
 use opte_api::Direction;
 use opte_api::LayerDesc;
 use opte_api::ListLayersResp;
@@ -343,6 +346,7 @@ impl PortBuilder {
             layers: self.layers.into_inner(),
             uft_in: FlowTable::new(&self.name, "uft_in", uft_limit, None),
             uft_out: FlowTable::new(&self.name, "uft_out", uft_limit, None),
+            uft_deps: BTreeMap::new(),
             tcp_flows: FlowTable::new(
                 &self.name,
                 "tcp_flows",
@@ -752,6 +756,15 @@ struct PortData {
     layers: Vec<Layer>,
     uft_in: FlowTable<UftEntry<InnerFlowId>>,
     uft_out: FlowTable<UftEntry<InnerFlowId>>,
+    // Index from a dependency recorded by an action (see
+    // `ActionMeta::add_dep`) to the outbound UFT entries built from it.
+    //
+    // Invariant: every live entry in `uft_out` appears under each of its
+    // dependencies. The converse need not hold: an entry which has since
+    // been removed (expired, evicted, invalidated, TCP close) may linger
+    // here until the next `expire_flows`, which prunes it. A lingering ID
+    // can at worst cause one needless invalidation, never a missed one.
+    uft_deps: BTreeMap<FlowDep, BTreeSet<InnerFlowId>>,
     // We keep a record of the inbound UFID in the TCP flow table so
     // that we know which inbound UFT/FT entries to retire upon
     // connection termination.
@@ -921,6 +934,7 @@ impl<N: NetworkImpl> Port<N> {
 
         data.uft_in.clear();
         data.uft_out.clear();
+        data.uft_deps.clear();
         data.tcp_flows.clear();
 
         self.stats.vals.out_uft_flows.set(0);
@@ -1083,6 +1097,7 @@ impl<N: NetworkImpl> Port<N> {
         check_state!(data.state, [PortState::Running])?;
         data.uft_in.clear();
         data.uft_out.clear();
+        data.uft_deps.clear();
         self.stats.vals.out_uft_flows.set(0);
         self.stats.vals.in_uft_flows.set(0);
         Ok(())
@@ -1190,11 +1205,64 @@ impl<N: NetworkImpl> Port<N> {
         data.uft_out.expire_flows(now);
         self.stats.vals.out_uft_flows.set(u64::from(data.uft_out.num_flows()));
 
+        // Forget dependency records for entries which are no longer in the
+        // UFT, whatever removed them. This is what keeps `uft_deps` bounded.
+        let PortData { uft_out, uft_deps, .. } = &mut *data;
+        uft_deps.retain(|_, flows| {
+            flows.retain(|ufid| uft_out.get(ufid).is_some());
+            !flows.is_empty()
+        });
+
         for l in &mut data.layers {
             l.expire_flows(now);
         }
 
         Ok(())
+    }
+
+    /// The number of distinct dependencies currently indexed, for testing
+    /// that the index is pruned.
+    #[cfg(any(feature = "std", test))]
+    pub fn uft_dep_count(&self) -> usize {
+        self.data.read().uft_deps.len()
+    }
+
+    /// Remove every outbound UFT entry (and its inbound partner) which was
+    /// built from the dependency `dep`, so that the next packet of each
+    /// affected flow is processed through the layers again.
+    ///
+    /// Call this *after* updating whatever state `dep` names. An action
+    /// recorded `dep` while holding this port's write lock, so a packet
+    /// either finished before this call (and its entry is removed here) or
+    /// starts after it (and sees the updated state).
+    ///
+    /// Flows which did not use `dep` are untouched.
+    ///
+    /// # States
+    ///
+    /// This command is valid for all states.
+    pub fn invalidate_flows_for(&self, dep: &FlowDep) {
+        let mut data = self.data.write();
+        let Some(flows) = data.uft_deps.remove(dep) else {
+            return;
+        };
+
+        for ufid_out in flows {
+            // The index may name entries that are already gone.
+            let Some((epoch, ufid_in)) = data.uft_out.get(&ufid_out).map(|e| {
+                let state = e.state();
+                (state.epoch, *state.pair.lock())
+            }) else {
+                continue;
+            };
+
+            self.uft_invalidate(
+                &mut data,
+                Some(&ufid_out),
+                ufid_in.as_ref(),
+                epoch,
+            );
+        }
     }
 
     /// Use the function `f` to probabilistically mark flows as being ready
@@ -2858,6 +2926,7 @@ impl<N: NetworkImpl> Port<N> {
         let mut xforms = Transforms::new();
         let flow_before = *pkt.flow();
         let res = self.layers_process(data, Out, pkt, &mut xforms, ameta);
+        let deps = ameta.take_deps();
 
         let mut flags = TransformFlags::empty();
         if pkt.checksums_dirty() {
@@ -2885,6 +2954,12 @@ impl<N: NetworkImpl> Port<N> {
                 match data.uft_out.add(flow_before, hte) {
                     Ok(v) => {
                         self.new_uft_kstat(Out, data);
+                        for dep in deps {
+                            data.uft_deps
+                                .entry(dep)
+                                .or_default()
+                                .insert(flow_before);
+                        }
                         match associate_lfts_upstack(data, &v, Direction::Out) {
                             Ok(_) => Ok(InternalProcessResult::Modified),
                             Err(OpteError::MaxCapacity(_)) => {

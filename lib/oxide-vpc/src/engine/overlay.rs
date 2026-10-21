@@ -160,6 +160,7 @@ use opte::engine::port::PortBuilder;
 use opte::engine::port::Pos;
 use opte::engine::port::meta::ActionMeta;
 use opte::engine::port::meta::ActionMetaValue;
+use opte::engine::port::meta::FlowDep;
 use opte::engine::predicate::DataPredicate;
 use opte::engine::predicate::Predicate;
 use opte::engine::rule::Action;
@@ -436,6 +437,10 @@ impl StaticAction for EncapAction {
 
                 RouterTargetInternal::Ip(_)
                 | RouterTargetInternal::VpcSubnet(_) => {
+                    // The transforms we generate embed the result of this
+                    // lookup, and are cached in the UFT. Record it so the
+                    // flow can be found and recomputed if the mapping changes.
+                    action_meta.add_dep(v2p_dep(self.vni, &recipient));
                     match self.v2p.get(&recipient) {
                         Some(phys) if !sent_from_eip => (
                             true,
@@ -776,6 +781,14 @@ impl fmt::Display for MulticastVniValidator {
     }
 }
 
+/// The [`FlowDep`] naming the V2P mapping for `vip` in the VPC `vni`.
+///
+/// [`EncapAction`] records this for every V2P lookup, and [`VpcMappings`]
+/// reports it when that mapping changes, so both must build it here.
+pub fn v2p_dep(vni: Vni, vip: &IpAddr) -> FlowDep {
+    FlowDep::new(format!("v2p:{}:{vip}", vni.as_u32()))
+}
+
 pub struct VpcMappings {
     inner: KMutex<BTreeMap<Vni, Arc<Virt2Phys>>>,
 }
@@ -789,15 +802,37 @@ impl VpcMappings {
     /// Add a new mapping from VIP to [`PhysNet`], returning a pointer
     /// to the [`Virt2Phys`] this mapping belongs to.
     pub fn add(&self, vip: IpAddr, phys: PhysNet) -> Arc<Virt2Phys> {
+        self.add_inner(vip, phys).0
+    }
+
+    /// Set the mapping from VIP to [`PhysNet`].
+    ///
+    /// Returns the [`FlowDep`] naming this mapping if the table actually
+    /// changed, i.e. the VIP was unmapped or mapped to something different.
+    /// Returns `None` if the identical mapping was already present.
+    ///
+    /// When this returns `Some`, flows cached from the old mapping are now
+    /// stale: pass the dependency to `Port::invalidate_flows_for` on every
+    /// port.
+    pub fn update(&self, vip: IpAddr, phys: PhysNet) -> Option<FlowDep> {
+        self.add_inner(vip, phys).1
+    }
+
+    fn add_inner(
+        &self,
+        vip: IpAddr,
+        phys: PhysNet,
+    ) -> (Arc<Virt2Phys>, Option<FlowDep>) {
         // We convert to GuestPhysAddr because it saves us from
         // redundant storage of the VNI.
         let guest_phys = GuestPhysAddr::from(phys);
         let mut lock = self.inner.lock();
 
         let v2p = lock.entry(phys.vni).or_default();
-        v2p.set(vip, guest_phys);
+        let old = v2p.set(vip, guest_phys);
+        let dep = (old != Some(guest_phys)).then(|| v2p_dep(phys.vni, &vip));
 
-        v2p.clone()
+        (v2p.clone(), dep)
     }
 
     /// Delete the mapping for the given VIP in the given VNI.

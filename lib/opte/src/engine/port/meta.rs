@@ -7,7 +7,33 @@
 use alloc::borrow::Cow;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::marker::PhantomData;
+
+/// A named piece of control-plane state that a cached flow was derived from.
+///
+/// An action which consults state that can change underneath an existing
+/// flow (e.g., a table mapping virtual to physical addresses) records a
+/// `FlowDep` for each lookup via [`ActionMeta::add_dep`]. The port remembers
+/// which UFT entries were built from which dependency, so that when the
+/// state changes the owner can call `Port::invalidate_flows_for` and have
+/// only the affected flows recomputed.
+///
+/// The key is opaque to OPTE. It only needs to be built the same way by the
+/// action that records it and by whoever later reports the change.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FlowDep(Arc<str>);
+
+impl FlowDep {
+    pub fn new(key: impl Into<Arc<str>>) -> Self {
+        Self(key.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// A value meant to be used in the [`ActionMeta`] map.
 ///
@@ -55,6 +81,7 @@ pub trait ActionMetaValue: Sized {
 #[derive(Default)]
 pub struct ActionMeta {
     inner: BTreeMap<Cow<'static, str>, Cow<'static, str>>,
+    deps: Vec<FlowDep>,
 }
 
 impl ActionMeta {
@@ -65,6 +92,24 @@ impl ActionMeta {
     /// Clear all entries.
     pub fn clear(&mut self) {
         self.inner.clear();
+        self.deps.clear();
+    }
+
+    /// Record that the result of the action currently being processed
+    /// depends on `dep`.
+    ///
+    /// If the flow being processed ends up cached in the UFT, the port will
+    /// remember the dependency so the entry can later be found and removed
+    /// when `dep` changes.
+    pub fn add_dep(&mut self, dep: FlowDep) {
+        if !self.deps.contains(&dep) {
+            self.deps.push(dep);
+        }
+    }
+
+    /// Remove and return all dependencies recorded so far.
+    pub fn take_deps(&mut self) -> Vec<FlowDep> {
+        core::mem::take(&mut self.deps)
     }
 
     /// Insert the key-value pair into the map, replacing any

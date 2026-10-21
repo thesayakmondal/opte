@@ -718,6 +718,154 @@ fn guest_to_guest() {
     }
 }
 
+// Send a SYN from g1 to `dst_ip` and return the underlay address the
+// packet was encapsulated towards.
+fn send_syn_from_g1(
+    g1: &PortAndVps,
+    g1_cfg: &VpcCfg,
+    dst_mac: MacAddr,
+    dst_ip: Ipv4Addr,
+) -> Ipv6Addr {
+    let mut pkt_m =
+        http_syn2(g1_cfg.guest_mac, g1_cfg.ipv4().private_ip, dst_mac, dst_ip);
+    let pkt = parse_outbound(&mut pkt_m, VpcParser {}).unwrap();
+    let res = g1.port.process(Out, pkt);
+    expect_modified!(res, pkt_m);
+    let pkt = parse_inbound(&mut pkt_m, VpcParser {}).unwrap();
+    pkt.meta().outer_v6.destination()
+}
+
+// Changing a V2P mapping must retire flows already cached from the old
+// mapping, so that traffic follows the new one (issue #221).
+#[test]
+fn v2p_change_invalidates_cached_flow() {
+    let g1_cfg = g1_cfg();
+    let g2_cfg = g2_cfg();
+    let mut g1 = oxide_net_setup("g1_port", &g1_cfg, None, None);
+    let g2_ip = g2_cfg.ipv4().private_ip;
+    g1.vpc_map.add(g2_ip.into(), g2_cfg.phys_addr());
+    g1.port.start();
+    set!(g1, "port_state=running");
+
+    // The first packet creates the flow, and the second is served from the
+    // UFT. Both go to g2's original underlay address.
+    for _ in 0..2 {
+        let dst = send_syn_from_g1(&g1, &g1_cfg, g2_cfg.guest_mac, g2_ip);
+        assert_eq!(dst, g2_cfg.phys_ip);
+    }
+    assert_eq!(g1.port.uft_dep_count(), 1);
+
+    // Move g2's address to a new sled.
+    let new_phys = PhysNet {
+        ip: Ipv6Addr::from_const([0xFD00, 0, 0, 0, 0, 0, 0x00F7, 0x0099]),
+        ..g2_cfg.phys_addr()
+    };
+    let dep = g1
+        .vpc_map
+        .update(g2_ip.into(), new_phys)
+        .expect("a different mapping is a change");
+
+    // Until we are told to invalidate, the cached flow still has the old
+    // destination. This is the staleness being fixed.
+    let dst = send_syn_from_g1(&g1, &g1_cfg, g2_cfg.guest_mac, g2_ip);
+    assert_eq!(dst, g2_cfg.phys_ip);
+
+    g1.port.invalidate_flows_for(&dep);
+    assert_eq!(g1.port.dump_uft().unwrap().out_num_flows, 0);
+
+    let dst = send_syn_from_g1(&g1, &g1_cfg, g2_cfg.guest_mac, g2_ip);
+    assert_eq!(dst, new_phys.ip);
+}
+
+// Invalidating one V2P mapping must leave flows to other addresses alone.
+#[test]
+fn v2p_change_keeps_unrelated_flows() {
+    let g1_cfg = g1_cfg();
+    let g2_cfg = g2_cfg();
+    let mut g1 = oxide_net_setup("g1_port", &g1_cfg, None, None);
+    let g2_ip = g2_cfg.ipv4().private_ip;
+    let other_ip = Ipv4Addr::from_const([172, 30, 0, 7]);
+    let other_phys = PhysNet {
+        ip: Ipv6Addr::from_const([0xFD00, 0, 0, 0, 0, 0, 0x00F7, 0x0077]),
+        ..g2_cfg.phys_addr()
+    };
+    g1.vpc_map.add(g2_ip.into(), g2_cfg.phys_addr());
+    g1.vpc_map.add(other_ip.into(), other_phys);
+    g1.port.start();
+    set!(g1, "port_state=running");
+
+    send_syn_from_g1(&g1, &g1_cfg, g2_cfg.guest_mac, g2_ip);
+    send_syn_from_g1(&g1, &g1_cfg, other_phys.ether, other_ip);
+    assert_eq!(g1.port.dump_uft().unwrap().out_num_flows, 2);
+    assert_eq!(g1.port.uft_dep_count(), 2);
+
+    let new_phys = PhysNet {
+        ip: Ipv6Addr::from_const([0xFD00, 0, 0, 0, 0, 0, 0x00F7, 0x0099]),
+        ..g2_cfg.phys_addr()
+    };
+    let dep = g1.vpc_map.update(g2_ip.into(), new_phys).unwrap();
+    g1.port.invalidate_flows_for(&dep);
+
+    // Only the flow to g2 was retired.
+    assert_eq!(g1.port.dump_uft().unwrap().out_num_flows, 1);
+    assert_eq!(g1.port.uft_dep_count(), 1);
+    let dst = send_syn_from_g1(&g1, &g1_cfg, other_phys.ether, other_ip);
+    assert_eq!(dst, other_phys.ip);
+}
+
+// Re-sending an identical mapping is not a change, so reports no dependency
+// and leaves the cached flows alone.
+#[test]
+fn v2p_update_reports_only_real_changes() {
+    let g2_cfg = g2_cfg();
+    let vpc_map = VpcMappings::new();
+    let g2_ip: IpAddr = g2_cfg.ipv4().private_ip.into();
+
+    // A new mapping is a change.
+    assert!(vpc_map.update(g2_ip, g2_cfg.phys_addr()).is_some());
+    // The same mapping again is not.
+    assert!(vpc_map.update(g2_ip, g2_cfg.phys_addr()).is_none());
+    // A different underlay address is.
+    let moved = PhysNet {
+        ip: Ipv6Addr::from_const([0xFD00, 0, 0, 0, 0, 0, 0x00F7, 0x0099]),
+        ..g2_cfg.phys_addr()
+    };
+    assert!(vpc_map.update(g2_ip, moved).is_some());
+    assert!(vpc_map.update(g2_ip, moved).is_none());
+}
+
+// Dependency records for flows which are gone, however they went, must not
+// accumulate.
+#[test]
+fn v2p_dep_index_is_pruned() {
+    let g1_cfg = g1_cfg();
+    let g2_cfg = g2_cfg();
+    let mut g1 = oxide_net_setup("g1_port", &g1_cfg, None, None);
+    let g2_ip = g2_cfg.ipv4().private_ip;
+    g1.vpc_map.add(g2_ip.into(), g2_cfg.phys_addr());
+    g1.port.start();
+    set!(g1, "port_state=running");
+
+    let now = Moment::now();
+    send_syn_from_g1(&g1, &g1_cfg, g2_cfg.guest_mac, g2_ip);
+    assert_eq!(g1.port.uft_dep_count(), 1);
+
+    // Expiry removes the flow, and prunes its dependency record with it.
+    g1.port
+        .expire_flows_at(now + Duration::new(FLOW_DEF_EXPIRE_SECS + 1, 0))
+        .unwrap();
+    assert_eq!(g1.port.dump_uft().unwrap().out_num_flows, 0);
+    assert_eq!(g1.port.uft_dep_count(), 0);
+
+    // Invalidating a dependency whose flows are already gone is harmless.
+    send_syn_from_g1(&g1, &g1_cfg, g2_cfg.guest_mac, g2_ip);
+    let dep = overlay::v2p_dep(g2_cfg.vni, &g2_ip.into());
+    g1.port.invalidate_flows_for(&dep);
+    g1.port.invalidate_flows_for(&dep);
+    assert_eq!(g1.port.uft_dep_count(), 0);
+    assert_eq!(g1.port.dump_uft().unwrap().out_num_flows, 0);
+}
+
 // Two guests on different, non-peered VPCs should not be able to
 // communicate.
 #[test]
